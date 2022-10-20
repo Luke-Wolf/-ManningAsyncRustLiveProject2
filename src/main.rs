@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use chrono::prelude::*;
 use clap::Parser;
+use futures_util::future::join_all;
 use std::io::{Error, ErrorKind};
-use tokio::join;
+use tokio::{join, time};
 use yahoo_finance_api as yahoo;
 
 #[derive(Parser, Debug)]
@@ -155,42 +156,54 @@ async fn main() -> std::io::Result<()> {
 
     // a simple way to output a CSV header
     println!("period start,symbol,price,change %,min,max,30d avg");
-    for symbol in opts.symbols.split(',') {
-        let closes = fetch_closing_data(&symbol, &from, &to).await?;
-        if !closes.is_empty() {
-            let price_difference_signal = PriceDifference {};
-            let min_price_signal = MinPrice {};
-            let max_price_signal = MaxPrice {};
-            let window_sma_signal = WindowedSMA { window_size: 30 };
-            // min/max of the period. unwrap() because those are Option types
-            let (period_max, period_min, sma) = join!(
-                max_price_signal.calculate(&closes),
-                min_price_signal.calculate(&closes),
-                window_sma_signal.calculate(&closes)
-            );
-            let period_max: f64 = period_max.unwrap();
-            let period_min: f64 = period_min.unwrap();
-            let last_price = *closes.last().unwrap_or(&0.0);
-            let (_, pct_change) = price_difference_signal
-                .calculate(&closes)
-                .await
-                .unwrap_or((0.0, 0.0));
-            let sma = sma.unwrap_or_default();
+    let mut interval = time::interval(time::Duration::from_secs(30));
+    loop {
+        interval.tick().await;
+        let mut closes_futures = vec![];
+        for symbol in opts.symbols.split(',') {
+            closes_futures.push(fetch_closing_data(&symbol, &from, &to))
+        }
+        let closes_futures = join_all(closes_futures);
 
-            // a simple way to output CSV data
-            println!(
-                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-                from.to_rfc3339(),
-                symbol,
-                last_price,
-                pct_change * 100.0,
-                period_min,
-                period_max,
-                sma.last().unwrap_or(&0.0)
-            );
+        let closes = closes_futures.await;
+        let closes = closes.iter().zip(opts.symbols.split(','));
+        for (result, symbol) in closes {
+            if let Ok(result) = result {
+                if !result.is_empty() {
+                    let price_difference_signal = PriceDifference {};
+                    let min_price_signal = MinPrice {};
+                    let max_price_signal = MaxPrice {};
+                    let window_sma_signal = WindowedSMA { window_size: 30 };
+                    // min/max of the period. unwrap() because those are Option types
+                    let (period_max, period_min, sma) = join!(
+                        max_price_signal.calculate(result),
+                        min_price_signal.calculate(result),
+                        window_sma_signal.calculate(result)
+                    );
+                    let period_max: f64 = period_max.unwrap();
+                    let period_min: f64 = period_min.unwrap();
+                    let last_price = *result.last().unwrap_or(&0.0);
+                    let (_, pct_change) = price_difference_signal
+                        .calculate(result)
+                        .await
+                        .unwrap_or((0.0, 0.0));
+                    let sma = sma.unwrap_or_default();
+
+                    // a simple way to output CSV data
+                    println!(
+                        "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+                        from.to_rfc3339(),
+                        symbol,
+                        last_price,
+                        pct_change * 100.0,
+                        period_min,
+                        period_max,
+                        sma.last().unwrap_or(&0.0)
+                    );
+                }
+            }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
